@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Model checkpoints (binary weights, can re-train)
+**/checkpoints/*.pth
+**/checkpoints/*.pkl
+
+# Dataset (binary files, too large)
+dataset/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Claude Code
+.claude/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_metadata/
+
+# Sensitive config (contains DB passwords)
+**/db_config.py
