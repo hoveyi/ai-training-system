@@ -55,6 +55,15 @@ def install_packages():
             print(f"✗ 安装失败: {e}")
             return False
 
+    # 检查 requirements.txt 是否存在，提示用户安装完整依赖
+    root = get_project_root().parent  # streamlist/ 的上级是项目根目录
+    req_file = root / 'requirements.txt'
+    if req_file.exists():
+        print(f"\n💡 提示: 运行 'pip install -r requirements.txt' 安装完整依赖")
+    else:
+        print("\n⚠ 未找到 requirements.txt，部分依赖可能需要手动安装")
+        print("  完整依赖包括: torch, torchvision, scikit-learn, matplotlib, seaborn, pymysql, python-docx, tqdm, nbformat")
+
     return True
 
 

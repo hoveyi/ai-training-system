@@ -7,13 +7,9 @@ import pandas as pd
 from db_config import get_db_connection, init_database
 import pymysql
 import numpy as np
-
-
-
 def hash_password(password):
     """密码哈希加密"""
     return hashlib.sha256(password.encode()).hexdigest()
-
 
 def validate_email(email):
     """验证邮箱格式"""

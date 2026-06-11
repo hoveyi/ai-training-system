@@ -39,18 +39,23 @@ def _load_flower_checkpoint(model_name='resnet50'):
     return _model_cache[cache_key]
 
 
-def _load_titanic_checkpoint():
-    if 'titanic' in _model_cache:
-        return _model_cache['titanic']
+def _load_titanic_checkpoint(model_name='mlp'):
+    cache_key = f'titanic_{model_name}'
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     path = os.path.join(project_root, 'backend', 'titanic_model', 'checkpoints', 'best_model.pth')
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = get_titanic_model(ckpt.get('model_name', 'mlp'), ckpt['input_dim']).to(device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    model = get_titanic_model(model_name, ckpt['input_dim']).to(device)
+    state_key = f'{model_name}_state_dict'
+    model.load_state_dict(ckpt[state_key])
     model.eval()
-    _model_cache['titanic'] = (model, ckpt['feature_cols'], ckpt.get('model_name', 'mlp'), device, ckpt.get('test_accuracy', 0))
-    return _model_cache['titanic']
+    result = (model, ckpt['feature_cols'], model_name, device,
+              ckpt.get(f'test_accuracy_{model_name}', 0),
+              ckpt.get('scaler_mean', None), ckpt.get('scaler_scale', None))
+    _model_cache[cache_key] = result
+    return result
 
 
 def _load_fashion_checkpoint(model_name='cnn'):
@@ -79,13 +84,18 @@ def _load_regression_checkpoint(model_name='mlp'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     path = os.path.join(project_root, 'backend', 'regression_model', 'checkpoints', 'best_model.pth')
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    output_dim = 3 if model_name == 'mlp' else 1
-    model = get_regression_model(model_name, input_dim=3, output_dim=output_dim).to(device)
+    # MLP: 3→3 静态映射; LSTM: (3,1)→3 序列视角多输出
+    input_dim = 3 if model_name == 'mlp' else 1
+    model = get_regression_model(model_name, input_dim=input_dim, output_dim=3).to(device)
     state_key = f'{model_name}_state_dict'
     model.load_state_dict(ckpt[state_key])
     model.eval()
     r2 = ckpt.get(f'r2_{model_name}', 0)
-    _model_cache[cache_key] = (model, ckpt, device, r2)
+    mse = ckpt.get(f'mse_{model_name}', 0)
+    # 共用 scaler（新格式），兼容旧格式
+    scaler_X = ckpt.get('scaler_X') or ckpt.get(f'scaler_X_{model_name}')
+    scaler_Y = ckpt.get('scaler_Y') or ckpt.get(f'scaler_Y_{model_name}')
+    _model_cache[cache_key] = (model, scaler_X, scaler_Y, device, r2, mse)
     return _model_cache[cache_key]
 # 导入登录模块
 from auth import login_ui, logout, user_profile_ui, admin_panel, require_auth
@@ -533,16 +543,8 @@ def titanic_survival():
         if submitted:
             with st.spinner("神经网络推理中..."):
                 try:
-                    # 加载模型
-                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                    path = os.path.join(project_root, 'backend', 'titanic_model', 'checkpoints', 'best_model.pth')
-                    ckpt = torch.load(path, map_location=device, weights_only=False)
-                    model = get_titanic_model(titanic_model_name, ckpt['input_dim']).to(device)
-                    state_key = f'{titanic_model_name}_state_dict'
-                    model.load_state_dict(ckpt[state_key])
-                    model.eval()
-                    feature_cols = ckpt['feature_cols']
-                    test_acc = ckpt.get(f'test_accuracy_{titanic_model_name}', 0)
+                    model, feature_cols, model_name, device, test_acc, scaler_mean, scaler_scale = \
+                        _load_titanic_checkpoint(titanic_model_name)
                 except FileNotFoundError:
                     st.error("模型权重未找到，请先运行 backend/titanic_model/train.py 训练模型")
                     return
@@ -556,9 +558,7 @@ def titanic_survival():
                 features = np.array([[pclass, sex_encoded, age, sibsp, parch, fare,
                                       embarked_map[embarked], family_size, is_alone]], dtype=np.float32)
 
-                scaler_mean = np.array(ckpt.get('scaler_mean', [2.3, 0.36, 29.7, 0.52, 0.38, 32.2, 1.8, 1.9, 0.4]), dtype=np.float32)
-                scaler_scale = np.array(ckpt.get('scaler_scale', [0.84, 0.48, 14.5, 1.1, 0.81, 49.7, 0.82, 1.6, 0.49]), dtype=np.float32)
-                features = (features - scaler_mean) / (scaler_scale + 1e-8)
+                features = (features - np.array(scaler_mean, dtype=np.float32)) / (np.array(scaler_scale, dtype=np.float32) + 1e-8)
 
                 x = torch.tensor(features).to(device)
                 with torch.no_grad():
@@ -770,144 +770,155 @@ def fashion_classification():
 @require_auth
 def nonlinear_regression():
     st.markdown("## 📈 非线性系统回归预测模型")
-    st.markdown("基于MLP/LSTM对多维非线性系统进行回归预测，系统自动学习输入-输出的复杂映射关系。")
+    st.markdown("基于 MLP / LSTM 对多维非线性系统进行回归预测，学习输入→输出的复杂映射关系。支持单点预测与批量 CSV 预测。")
 
-    tab1, tab2 = st.tabs(["🔮 回归预测", "📚 预测历史"])
+    tab1, tab2, tab3 = st.tabs(["🔮 单点预测", "📋 批量预测", "📚 预测历史"])
 
     with tab1:
         reg_model_choice = st.selectbox(
             "🧠 模型架构",
-            ["mlp (多层感知机, 单点预测)", "lstm (时序记忆网络, 序列预测)"],
-            help="MLP: 4层全连接，适合特征向量→输出映射 | LSTM: 循环网络，适合时序动态系统预测"
+            ["mlp (多层感知机, 直接映射)", "lstm (序列视角, 特征交互建模)"],
+            help="MLP: 全连接直接映射 3→3 | LSTM: 将3个输入特征视为序列，通过循环结构捕获特征间依赖后映射到3维输出"
         )
         reg_model_name = reg_model_choice.split(" ")[0]
 
-        if reg_model_name == 'mlp':
-            st.markdown("#### 输入特征向量（3维非线性系统状态）")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                x1 = st.number_input("特征 x₁", value=0.5, step=0.1, format="%.2f")
-            with col2:
-                x2 = st.number_input("特征 x₂", value=0.2, step=0.1, format="%.2f")
-            with col3:
-                x3 = st.number_input("特征 x₃", value=0.8, step=0.1, format="%.2f")
+        st.markdown("#### 输入特征向量（3 维非线性系统输入）")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            x1 = st.number_input("特征 x₁", value=0.5, step=0.1, format="%.2f")
+        with col2:
+            x2 = st.number_input("特征 x₂", value=0.2, step=0.1, format="%.2f")
+        with col3:
+            x3 = st.number_input("特征 x₃", value=0.8, step=0.1, format="%.2f")
 
-            if st.button("🔮 预测系统输出", key="reg_mlp"):
-                with st.spinner("MLP回归预测中..."):
-                    try:
-                        model, ckpt, device, r2 = _load_regression_checkpoint('mlp')
-                        scaler_X = ckpt['scaler_X_mlp']
-                        scaler_Y = ckpt['scaler_Y_mlp']
-                    except FileNotFoundError:
-                        st.error("模型权重未找到，请先运行 backend/regression_model/train.py 训练模型")
-                        return
+        if st.button("🔮 预测系统输出", key="reg_predict"):
+            with st.spinner(f"{reg_model_name.upper()} 回归预测中..."):
+                try:
+                    model, scaler_X, scaler_Y, device, r2, mse = _load_regression_checkpoint(reg_model_name)
+                except FileNotFoundError:
+                    st.error("模型权重未找到，请先运行 Notebook 或 train.py 训练模型")
+                    return
 
-                    features = np.array([[x1, x2, x3]], dtype=np.float32)
-                    features_scaled = scaler_X.transform(features)
+                features = np.array([[x1, x2, x3]], dtype=np.float32)
+                features_scaled = scaler_X.transform(features)
+
+                if reg_model_name == 'lstm':
+                    x_tensor = torch.tensor(features_scaled).unsqueeze(-1).to(device)  # (1, 3, 1)
+                else:
                     x_tensor = torch.tensor(features_scaled).to(device)
 
-                    with torch.no_grad():
-                        y_scaled = model(x_tensor).cpu().numpy()
-                        y_pred = scaler_Y.inverse_transform(y_scaled)[0]
+                with torch.no_grad():
+                    y_scaled = model(x_tensor).cpu().numpy()
+                    y_pred = scaler_Y.inverse_transform(y_scaled)[0]
 
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("预测 y₁", f"{y_pred[0]:.4f}")
-                    with col2:
-                        st.metric("预测 y₂", f"{y_pred[1]:.4f}")
-                    with col3:
-                        st.metric("预测 y₃", f"{y_pred[2]:.4f}")
+                # 显示预测结果
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("预测 y₁", f"{y_pred[0]:.4f}")
+                with col2:
+                    st.metric("预测 y₂", f"{y_pred[1]:.4f}")
+                with col3:
+                    st.metric("预测 y₃", f"{y_pred[2]:.4f}")
 
-                    st.markdown("**模型信息**")
-                    st.latex(r"\hat{\mathbf{y}} = f_{\text{MLP}}(x_1, x_2, x_3)")
-                    st.info(f"模型R²得分: {r2:.4f} | 非线性系统包含正弦、余弦、指数等高阶耦合项")
+                st.markdown("**模型评估指标**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("R² 得分", f"{r2:.4f}", help="越接近 1 越好，衡量模型对非线性系统的拟合程度")
+                with c2:
+                    st.metric("MSE", f"{mse:.6f}", help="均方误差，越小越好，衡量预测值与真实值的平均偏差")
 
-                    # 保存记录
-                    user_id = st.session_state.get('user_id')
-                    if user_id:
-                        log_activity(user_id=user_id, activity_type='prediction',
-                                     model_name='regression_mlp',
-                                     input_data=f'[{x1:.2f}, {x2:.2f}, {x3:.2f}]',
-                                     prediction_result=f'[{y_pred[0]:.4f}, {y_pred[1]:.4f}, {y_pred[2]:.4f}]',
-                                     confidence_score=r2, processing_time=0.01, status='success')
-                        update_model_stats('nonlinear_regression', r2, 0.01)
-        else:
-            st.markdown("#### 时序序列输入（LSTM滑动窗口预测）")
-            st.markdown("输入10个连续时间步的系统状态，预测下一时刻的输出值。")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                seq_input = st.text_area(
-                    "输入10个时间步（每行3个特征值，空格分隔）",
-                    value="0.0 0.0 0.0\n0.1 0.05 0.02\n0.2 0.10 0.05\n0.3 0.15 0.10\n0.4 0.20 0.15\n0.5 0.25 0.20\n0.6 0.30 0.25\n0.7 0.35 0.30\n0.8 0.40 0.35\n0.9 0.45 0.40",
-                    height=200,
-                    help="每行表示一个时间步，3个值分别对应 x₁, x₂, x₃"
-                )
-            with col2:
-                st.caption("💡 格式说明:")
-                st.caption("- 每行一个时间步")
-                st.caption("- 每行3个数值（空格分隔）")
-                st.caption("- 共需要10行（seq_len=10）")
-                st.caption("- 系统会自动计算下一时刻输出")
-
-            if st.button("📉 运行序列预测", key="reg_lstm"):
-                with st.spinner("LSTM序列预测中..."):
-                    try:
-                        lines = [line.strip() for line in seq_input.strip().split('\n') if line.strip()]
-                        values = [list(map(float, line.split())) for line in lines]
-                        if len(values) != 10:
-                            st.error(f"需要恰好10行输入，当前{len(values)}行")
-                            return
-                        data = np.array(values, dtype=np.float32)
-                    except Exception as e:
-                        st.error(f"输入格式错误: {e}")
-                        return
-
-                    try:
-                        model, ckpt, device, r2 = _load_regression_checkpoint('lstm')
-                        scaler_X = ckpt['scaler_X_lstm']
-                        scaler_Y = ckpt['scaler_Y_lstm']
-                    except FileNotFoundError:
-                        st.error("模型权重未找到，请先运行 backend/regression_model/train.py 训练模型")
-                        return
-
-                    # 标准化
-                    data_scaled = scaler_X.transform(data)
-                    x_tensor = torch.tensor(data_scaled).unsqueeze(0).to(device)  # (1, seq_len, 3)
-
-                    with torch.no_grad():
-                        y_scaled = model(x_tensor).cpu().numpy()
-                        y_pred = scaler_Y.inverse_transform(y_scaled.reshape(-1, 1))[0][0]
-
-                    st.metric("预测下一时刻输出值", f"{y_pred:.4f}")
-
-                    # 可视化序列
-                    times = list(range(10))
-                    st.markdown("#### 输入序列特征")
-                    df_seq = pd.DataFrame({
-                        "时间步": times,
-                        "x₁": data[:, 0],
-                        "x₂": data[:, 1],
-                        "x₃": data[:, 2],
-                    })
-                    st.line_chart(df_seq.set_index("时间步"))
-                    st.info(f"模型R²得分: {r2:.4f} | 基于Lorenz-like混沌非线性系统")
-
-                    user_id = st.session_state.get('user_id')
-                    if user_id:
-                        log_activity(user_id=user_id, activity_type='prediction',
-                                     model_name='regression_lstm',
-                                     input_data=f'sequence_{len(data)}steps',
-                                     prediction_result=f'{y_pred:.4f}',
-                                     confidence_score=r2, processing_time=0.01, status='success')
-                        update_model_stats('nonlinear_regression', r2, 0.01)
+                # 保存预测记录到数据库
+                user_id = st.session_state.get('user_id')
+                if user_id:
+                    log_activity(user_id=user_id, activity_type='prediction',
+                                 model_name=f'regression_{reg_model_name}',
+                                 input_data=f'[{x1:.2f}, {x2:.2f}, {x3:.2f}]',
+                                 prediction_result=f'[{y_pred[0]:.4f}, {y_pred[1]:.4f}, {y_pred[2]:.4f}]',
+                                 confidence_score=r2, processing_time=0.01, status='success')
+                    update_model_stats('nonlinear_regression', r2, mse)
 
     with tab2:
+        st.markdown("#### 📋 批量 CSV 预测")
+        st.markdown("上传一个 CSV 文件（含 3 列：x1, x2, x3），系统将批量预测并返回 y1, y2, y3 及 MSE。")
+
+        csv_model_choice = st.selectbox(
+            "🧠 模型架构",
+            ["mlp (多层感知机)", "lstm (序列视角)"],
+            key='csv_model'
+        )
+        csv_model_name = csv_model_choice.split(" ")[0]
+
+        uploaded_csv = st.file_uploader("上传 CSV 文件", type=['csv'], key='reg_csv')
+
+        if uploaded_csv is not None:
+            try:
+                df_input = pd.read_csv(uploaded_csv)
+                if df_input.shape[1] < 3:
+                    st.error(f"CSV 需要至少3列（x1, x2, x3），当前{df_input.shape[1]}列")
+                else:
+                    st.markdown(f"**已加载 {len(df_input)} 条数据**")
+                    st.dataframe(df_input.head(10), width='stretch')
+
+                    if st.button("📊 批量预测", key='csv_predict'):
+                        with st.spinner(f"正在预测 {len(df_input)} 条数据..."):
+                            try:
+                                model, scaler_X, scaler_Y, device, r2, mse = _load_regression_checkpoint(csv_model_name)
+                            except FileNotFoundError:
+                                st.error("模型权重未找到")
+                                return
+
+                            X_input = df_input.iloc[:, :3].values.astype(np.float32)
+                            X_scaled = scaler_X.transform(X_input)
+
+                            if csv_model_name == 'lstm':
+                                x_tensor = torch.tensor(X_scaled).unsqueeze(-1).to(device)  # (N, 3, 1)
+                            else:
+                                x_tensor = torch.tensor(X_scaled).to(device)
+
+                            with torch.no_grad():
+                                y_scaled = model(x_tensor).cpu().numpy()
+                                y_pred_all = scaler_Y.inverse_transform(y_scaled)
+
+                            # 构造结果表
+                            df_result = pd.DataFrame({
+                                'x1': X_input[:, 0], 'x2': X_input[:, 1], 'x3': X_input[:, 2],
+                                'y1_pred': y_pred_all[:, 0], 'y2_pred': y_pred_all[:, 1], 'y3_pred': y_pred_all[:, 2],
+                            })
+                            st.markdown("#### 预测结果")
+                            st.dataframe(df_result, width='stretch')
+
+                            # 下载按钮
+                            csv_out = df_result.to_csv(index=False).encode('utf-8-sig')
+                            st.download_button("⬇ 下载预测结果 CSV", csv_out,
+                                               "regression_predictions.csv", "text/csv")
+
+                            # 模型指标
+                            st.markdown("**模型评估指标**")
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.metric("模型 R²", f"{r2:.4f}")
+                            with c2:
+                                st.metric("模型 MSE", f"{mse:.6f}")
+
+                            # 保存批量预测记录到数据库
+                            user_id = st.session_state.get('user_id')
+                            if user_id:
+                                log_activity(user_id=user_id, activity_type='batch_prediction',
+                                             model_name=f'regression_{csv_model_name}',
+                                             input_data=f'CSV batch ({len(df_input)} rows)',
+                                             prediction_result=f'Batch completed ({len(df_result)} rows), MSE={mse:.6f}',
+                                             confidence_score=r2, processing_time=0.1, status='success')
+                                update_model_stats('nonlinear_regression', r2, mse)
+
+            except Exception as e:
+                st.error(f"CSV 解析失败: {e}")
+
+    with tab3:
         st.markdown("### 📚 预测历史")
         username = st.session_state.get('username')
         if username:
             from auth import get_user_activities
-            activities = get_user_activities(username, limit=30)
+            activities = get_user_activities(username, limit=50)
             reg_records = [a for a in activities if (a.get('model_name') or '').startswith('regression')]
             if reg_records:
                 df = pd.DataFrame(reg_records)
@@ -923,9 +934,7 @@ def nonlinear_regression():
 def main():
     from db_config import init_database
     init_database()
-
     local_css()
-
     # 处理未登录状态 - 显示登录界面
     if not st.session_state.get('logged_in', False):
         login_ui()

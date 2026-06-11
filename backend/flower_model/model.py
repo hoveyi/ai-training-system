@@ -65,8 +65,6 @@ class FlowerClassifier(nn.Module):
 
 
 class SimpleCNN(nn.Module):
-    """简化的CNN模型，适合从零训练"""
-
     def __init__(self, num_classes=5):
         super(SimpleCNN, self).__init__()
 

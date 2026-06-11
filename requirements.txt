@@ -1,0 +1,38 @@
+# ============================================
+# AI综合应用系统 - Python 依赖
+# ============================================
+# 安装方式: pip install -r requirements.txt
+# 注意: PyTorch 建议根据 CUDA 版本从官网安装
+#       https://pytorch.org/get-started/locally/
+# ============================================
+
+# --- 深度学习框架 ---
+torch>=2.0.0
+torchvision>=0.15.0
+
+# --- Web 应用 ---
+streamlit>=1.28.0
+
+# --- 数据处理 ---
+numpy>=1.24.0
+pandas>=2.0.0
+Pillow>=10.0.0
+
+# --- 数据库 ---
+pymysql>=1.1.0
+
+# --- 机器学习工具 ---
+scikit-learn>=1.3.0
+
+# --- 可视化 ---
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# --- 训练进度条 ---
+tqdm>=4.65.0
+
+# --- 文档生成 ---
+python-docx>=0.8.11
+
+# --- Notebook 生成 ---
+nbformat>=5.9.0
